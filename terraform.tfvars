@@ -8,8 +8,10 @@ ibm_bmx_api_key = ""
 ibm_sl_username = ""
 ibm_sl_api_key = ""
  
-## (optional)the datacenter to create resources in
-## datacenter = "tor01"
+## (optional)the datacenter to create vm resources in
+## datacenter = "dal12"
+## (optional)the datacenter to create bare metal resources in
+## datacenter_bare_metal = "tor01"
 ## (optional)choose charge method, hourly for true and monthly for false
 ## hourly_billing_master = true
 ## hourly_billing_compute = true
@@ -45,7 +47,7 @@ entitlement = ""
 ## cluster_name = "mycluster"
 
 ## (optional)	specify OS to use for your cluster
-## os_reference = "CENTOS_LATEST"
+## os_reference = "CENTOS_7_64"
 ## (optional)	specify dns domain name
 ## domain_name = "domain.com"
 ## (optional)	specify host name prefix for master/compute/development nodes
@@ -73,10 +75,19 @@ entitlement = ""
 ## (optional) specify if to resolve hostnames with intranet ip addresses
 ## use_intranet = true
 ## (optional) create baremetal masters if ture, otherwise create vm masters
-## master_use_baremetal = false
-## (optional) baremetal preset configuration
-## fixed_config_preset = "S1270_32GB_1X1TBSATA_NORAID"
+## master_use_bare_metal = false
+## (optional)	specify OS to use for your bare metal nodes
+## os_reference_bare_metal = "UBUNTU_16_64"
+## (optional) baremetal preset configuration, gpu configruations include
+## D2620_128GB_2X1TB_SATA_RAID_1_M60_GPU1, D2690V4_128GB_2X4TB_SATA_RAID_1_K2_GPU2
+## D2620V4_128GB_2X800GB_SSD_RAID_1_K80_GPU2, D2690_256GB_2X4TB_SATA_RAID1_2XM60_GPU_RAID_1
+## fixed_config_preset = "S1270_32GB_2X960GBSSD_NORAID"
 ## (optional)	specify number of bare metal compute nodes to create
 ## number_of_compute_bare_metal = 0
 ## (optional) specify hostname prefix for bare metal compute nodes
 ## prefix_compute_bare_metal = "bmcompute"
+## {optional) your private SSH key to remote execute on bare metal machines
+## ssh_private_key = <<EOF
+## multiple line supported
+## past your ssh private key here
+## EOF

@@ -1,10 +1,26 @@
 #!/bin/bash
 
-declare -i ROUND=0
 declare -i numbercomputes
-DEBUG=1
-LOG_FILE=/root/sym_deploy_log
 
+##retrieve user_metadata on bare metal
+if [ ! -f /root/user_metadata_bare_metal ]
+then
+	if dmidecode | egrep -q "HVM|Xen"
+	then
+		echo "on vm instance"
+	elif dmidecode | egrep -q "No SMBIOS nor DMI entry point found"
+	then
+		echo "on vm instance"
+	else
+		wget --no-check-certificate -O /root/user_metadata_bare_metal https://api.service.softlayer.com/rest/v3/SoftLayer_Resource_Metadata/UserMetadata.txt
+	fi
+fi
+[ -f /root/user_metadata ] && . /root/user_metadata
+[ -f /root/user_metadata_bare_metal ] && . /root/user_metadata_bare_metal
+LOG_FILE=/root/log_deploy_${product}
+
+##run only once cloud config is not there##
+[ -f /tmp/deploy ] && exit || touch /tmp/deploy
 
 ###################COMMON SHELL FUNCTIONS#################
 function LOG ()
@@ -12,320 +28,209 @@ function LOG ()
 	echo -e `date` "$1" >> "$LOG_FILE"
 }
 
-function help()
+function funcSetupProxyService()
 {
-	echo "Usage: $0"
-	exit
+	if [ "${role}" == "master" ]
+	then
+		if [ -f /etc/redhat-release ]
+		then
+			LOG "\tyum -y install squid"
+			yum -y install squid
+			systemctl enable squid
+			systemctl start squid
+		elif [ -f /etc/lsb-release ]
+		then
+			apt-get update
+			export DEBIAN_FRONTEND=noninteractive
+			LOG "\tapt-get -y install squid"
+			apt-get install -y squid
+			sed -i 's/#acl localnet src 10/acl localnet src 10/' /etc/squid/squid.conf
+			sed -i 's/#http_access allow localnet/http_access allow localnet/' /etc/squid/squid.conf
+			systemctl enable squid
+			systemctl restart squid
+		else
+			echo "not proxy setup"
+		fi
+	fi
+}
+
+function funcUseProxyService()
+{
+	if [ "${useintranet}" != "false" -a "${role}" != "master" -a "${role}" != "failover" -a "${role}" != "symde" ]
+	then
+		realmasterprivateipaddress=`echo ${masterprivateipaddress} | awk '{print $1}'`
+		export http_proxy=http://${realmasterprivateipaddress}:3128
+		export https_proxy=http://${realmasterprivateipaddress}:3128
+		export ftp_proxy=http://${realmasterprivateipaddress}:3128
+		echo export http_proxy=http://${realmasterprivateipaddress}:3128 >> /root/.bash_profile
+		echo export https_proxy=http://${realmasterprivateipaddress}:3128 >> /root/.bash_profile
+		echo export ftp_proxy=http://${realmasterprivateipaddress}:3128 >> /root/.bash_profile
+		if [ -f /etc/redhat-release ]
+		then
+			echo "proxy=http://${realmasterprivateipaddress}:3128" >> /etc/yum.conf
+		elif [ -f /etc/lsb-release ]
+		then
+			echo "Acquire::http::Proxy \"http://${realmasterprivateipaddress}:3128/\";" > /etc/apt/apt.conf
+		else
+			echo noconfig
+		fi
+	fi
 }
 
 function os_config()
 {
 	LOG "configuring os ..."
+	# check metadata to see if we need use internet interface
+	if [ "$useintranet" == "0" ]
+	then
+		useintranet=false
+	elif [ "$useintranet" == "1" ]
+	then
+		useintranet=true
+	else
+		echo "no action"
+	fi
+	funcSetupProxyService
+	funcUseProxyService
 	if [ -f /etc/redhat-release ]
 	then
 		LOG "\tyum -y install ed tree lsof psmisc nfs-utils net-tools"
 		yum -y install ed tree lsof psmisc nfs-utils net-tools
-	fi
-}
-
-function add_admin_user()
-{
-	user_id=`id $1 2>>/dev/null`
-	if [ "$?" != "0" ]; then
-		useradd -d /home/$1 -s /bin/bash $1 >/dev/null 2>&1
-		ls /home/$1 > /dev/null
+	elif [ -f /etc/lsb-release ]
+	then
+		LOG "\tapt-get bash install -y wget curl tree ncompress gettext rpm nfs-kernel-server acl"
+		apt-get update
+		export DEBIAN_FRONTEND=noninteractive
+		if  cat /etc/lsb-release | egrep -qi "ubuntu 16"
+		then
+			apt-get install -y --allow-downgrades --allow-remove-essential --allow-change-held-packages  wget curl tree ncompress gettext rpm nfs-kernel-server acl
+		else
+			apt-get install -y --force-yes  wget curl tree ncompress gettext rpm nfs-kernel-server acl
+		fi
 	else
-		LOG "User $1 exists already."
+		echo "os_config not handled"
+	fi
+	if [ -h /bin/sh -a -f /bin/bash ]
+	then
+		rm -f /bin/sh
+		cp /bin/bash /bin/sh
+	fi
+	if [ -f /etc/cloud/cloud.cfg ]
+	then
+		sed -i 's/\(.*\)update_etc_hosts/#\1update_etc_hosts/' /etc/cloud/cloud.cfg
 	fi
 }
 
 function funcGetPrivateIp()
 {
-	## for distributions using ifconfig and eth0
-	ifconfig eth0 | grep "inet " | awk '{print $2}' | sed -e 's/addr://'
+	ip address show | egrep "inet .*global" | egrep "inet[ ]+10\." | head -1 | awk '{print $2}' | sed -e 's/\/.*//'
 }
 
 function funcGetPublicIp()
 {
-	## for distributions using ifconfig and eth0
-	ifconfig eth1 | grep "inet " | awk '{print $2}' | sed -e 's/addr://'
+	ip address show | egrep "inet .*global" | egrep -v "inet[ ]+10\." | head -1 | awk '{print $2}' | sed -e 's/\/.*//'
 }
 
-function funcGetPrivateMask()
+function funcStartFailoverService()
 {
-	## for distributions using ifconfig and eth0
-	ifconfig eth0 | grep "inet " | awk '{print $4}' | sed -e 's/Mask://'
+	mkdir -p /failover
+	echo -e "/failover\t\t10.0.0.0/8(rw,no_root_squash) 172.16.0.0/12(rw,no_root_squash) 192.168.0.0/16(rw,no_root_squash)" > /etc/exports
+	if [ -f /etc/redhat-release ]
+	then
+		systemctl enable nfs
+		systemctl start nfs
+	elif [ -f /etc/lsb-release ]
+	then
+		systemctl enable nfs-server
+		systemctl restart nfs-server
+	else
+		echo "not known"
+	fi
 }
 
-function funcGetPublicMask()
+function funcConnectFailoverService()
 {
-	## for distributions using ifconfig and eth0
-	ifconfig eth1 | grep "inet " | awk '{print $4}' | sed -e 's/Mask://'
+	#if [ -n "${nfsipaddress}" -a "$useintranet" == 'true' ]
+	if [ -n "${nfsipaddress}" ]
+	then
+		mkdir -p /failover
+		while ! mount | grep failover | grep -v grep
+		do
+			LOG "\tmounting /failover ..."
+			mount -o tcp,vers=3,rsize=32768,wsize=32768 ${nfsipaddress}:/failover /failover
+			touch /failover/connected-${localhostname}
+			sleep 60
+		done
+		sed -i '/failover/d' /etc/fstab
+		echo -e "${nfsipaddress}:/failover\t/failover\tnfs\trsize=32768,wsize=32768\t2 2" >> /etc/fstab
+		LOG "\tmounted /failover ..."
+	fi
 }
 
 function funcStartConfService()
 {
-	mkdir -p /export
-	if [ "$useintranet" == "true" ]
+	if [ "$role" == "master" ]
 	then
-		network=`ipcalc -n $localipaddress $localnetmask | sed -e 's/.*=//'`
-		echo -e "/export\t\t${network}/${localnetmask}(ro,no_root_squash)" > /etc/exports
-		systemctl start nfs
+		mkdir -p /export
+		echo -e "/export\t\t10.0.0.0/8(ro,no_root_squash) 172.16.0.0/12(ro,no_root_squash) 192.168.0.0/16(ro,no_root_squash)" > /etc/exports
+		if [ -f /etc/redhat-release ]
+		then
+			systemctl enable nfs
+			systemctl start nfs
+		elif [ -f /etc/lsb-release ]
+		then
+			systemctl enable nfs-server
+			systemctl restart nfs-server
+		else
+			echo "not known"
+		fi
 	fi
 }
 
 function funcConnectConfService()
 {
 	mkdir -p /export
-	if [ "$useintranet" == 'true' ]
+	if [ "${role}" == "symde" ]
 	then
-		while ! mount | grep export | grep -v grep
-		do
-			LOG "\tmounting /export ..."
-			mount -o tcp,vers=3,rsize=32768,wsize=32768 ${masteripaddress}:/export /export
-			sleep 60
-		done
-		LOG "\tmounted /export ..."
-	fi
-}
-####################FUNCTION PYTHON SCRIPTS##################
-function create_udp_server()
-{
-	cat << ENDF > /tmp/udpserver.py
-#!/usr/bin/env python
-
-ETC_HOSTS = '/etc/hosts'
-import re, socket
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind(('0.0.0.0',9999))
-while True:
-	data, addr = s.recvfrom(1024)
-	print('Received from %s:%s.' % addr)
-	if re.match(r'^update', data, re.I):
-		record = data.strip().split()[1:]
-		if len(record) == 3 and re.match(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', record[0]):
-			with open(ETC_HOSTS,'a') as f:
-				f.write("%s\t%s\t%s\n" % (record[0],record[1],record[2]))
-	s.sendto("done", addr)
-ENDF
-	chmod +x /tmp/udpserver.py
-	nohup python /tmp/udpserver.py >> /tmp/udpserver.log 2>&1 &
-}
-
-function create_udp_client()
-{
-	cat << ENDF > /tmp/udpclient.py
-#!/usr/bin/env python
-
-import socket
-import sys
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-for data in sys.argv:
-	print(data)
-	s.sendto(data,('${masteripaddress}',9999))
-	print(s.recv(1024))
-s.close()
-ENDF
-	chmod +x /tmp/udpclient.py
-}
-
-function get_user_metadata()
-{
-	cat << ENDF > /tmp/user_metadata.py
-import subprocess
-import json
-output = subprocess.check_output("curl https://api.service.softlayer.com/rest/v3/SoftLayer_Resource_Metadata/UserMetadata.txt 2>/dev/null; echo test > /dev/null",shell=True)
-user_metadata = json.loads(output)
-print("export METADATA=\"METADATA\"")
-for key in user_metadata.keys():
-	print("%s=\"%s\"" % (key,user_metadata[key]))
-ENDF
-}
-
-#####################SHELL FUNCTIONS RELATED#################
-function update_profile_d()
-{
-	if [ -d /etc/profile.d ]
+		echo doing nothing
+	elif [ "$role" == "failover" -o "$role" == "compute" ]
 	then
-		if [ "${ROLE}" == "symhead" -o "${ROLE}" == 'symcompute' ]
+		if [ -n "${masteripaddress}" -a "$useintranet" == 'true' ]
 		then
-			echo "[ -f /opt/ibm/spectrumcomputing/profile.platform ] && source /opt/ibm/spectrumcomputing/profile.platform" > /etc/profile.d/symphony.sh
-			echo "[ -f /opt/ibm/spectrumcomputing/cshrc.platform ] && source /opt/ibm/spectrumcomputing/cshrc.platform" > /etc/profile.d/symphony.csh
-		elif [ "${ROLE}" == "symde" ]
-		then
-			echo "[ -f /opt/ibm/spectrumcomputing/symphonyde/de72/profile.platform ] && source /opt/ibm/spectrumcomputing/symphonyde/de72/profile.platform" > /etc/profile.d/symphony.sh
-			echo "[ -f /opt/ibm/spectrumcomputing/symphonyde/de72/profile.client ] && source /opt/ibm/spectrumcomputing/symphonyde/de72/profile.client" >> /etc/profile.d/symphony.sh
-			echo "[ -f /opt/ibm/spectrumcomputing/symphonyde/de72/cshrc.platform ] && source /opt/ibm/spectrumcomputing/symphonyde/de72/cshrc.platform" > /etc/profile.d/symphony.csh
-			echo "[ -f /opt/ibm/spectrumcomputing/symphonyde/de72/cshrc.client ] && source /opt/ibm/spectrumcomputing/symphonyde/de72/cshrc.client" >> /etc/profile.d/symphony.csh
-		else
-			echo "nothing to update"
-		fi
-	fi
-}
-
-function app_depend()
-{
-	LOG "handle symphony dependancy ..."
-	if [ "${PRODUCT}" == "SYMPHONY" -o "${PRODUCT}" == "symphony" ]
-	then
-		LOG "\tyum -y install java-1.7.0-openjdk gcc gcc-c++ glibc.i686 httpd"
-		yum -y install java-1.7.0-openjdk gcc gcc-c++ glibc.i686 httpd
-	elif [ "${PRODUCT}" == "LSF" -o "${PRODUCT}" == "lsf" ]
-	then
-		LOG "...handle lsf dependancy"
-	else
-		LOG "...unknown application"
-	fi
-}
-
-function download_packages()
-{
-	if [ "$MASTERHOSTNAMES" == "$MASTERHOST" ]
-	then
-		# we can get the package from anywhere applicable, then export through nfs://export, not implemented here yet
-		if [ "${PRODUCT}" == "SYMPHONY" -o "$PRODUCT" == "symphony" ]
-		then
-			LOG "download symphony packages ..."
-			mkdir -p /export/symphony/${VERSION}
-			if [ "${VERSION}" == "latest" ]
-			then
-				ver_in_pkg=7.2.0.0
-			else
-				ver_in_pkg=${VERSION}
-			fi
-			if [ "$ROLE" == 'symhead' -o "${ROLE}" == 'lsfmaster' ]
-			then
-				LOG "\twget -nH -c --limit-rate=10m http://158.85.106.44/export/symphony/${VERSION}/sym-${ver_in_pkg}_x86_64.bin"
-				cd /export/symphony/${VERSION} && wget -nH -c --limit-rate=10m http://158.85.106.44/export/symphony/${VERSION}/sym-${ver_in_pkg}_x86_64.bin
-				touch /export/download_finished
-			else
-				if [ "$useintranet" == 'false' ]
-				then
-					if [ "${ROLE}" == "symcompute" ]
-					then
-						LOG "\twget -nH -c --limit-rate=10m http://158.85.106.44/export/symphony/${VERSION}/sym-${ver_in_pkg}_x86_64.bin"
-						cd /export/symphony/${VERSION} && wget -nH -c --limit-rate=10m http://158.85.106.44/export/symphony/${VERSION}/sym-${ver_in_pkg}_x86_64.bin
-						touch /export/download_finished
-					elif [ "${ROLE}" == 'symde' ]
-					then
-						LOG "\twget -nH -c --limit-rate=10m http://158.85.106.44/export/symphony/${VERSION}/symde-${ver_in_pkg}_x86_64.bin"
-						cd /export/symphony/${VERSION} && wget -nH -c --limit-rate=10m http://158.85.106.44/export/symphony/${VERSION}/symde-${ver_in_pkg}_x86_64.bin
-						touch /export/download_finished
-					else
-						echo "no download"
-					fi
-				else
-					if [ "${ROLE}" == 'symde' ]
-					then
-						LOG "\twget -nH -c --limit-rate=10m http://158.85.106.44/export/symphony/${VERSION}/symde-${ver_in_pkg}_x86_64.bin"
-						cd /export/symphony/${VERSION} && wget -nH -c --limit-rate=10m http://158.85.106.44/export/symphony/${VERSION}/symde-${ver_in_pkg}_x86_64.bin
-						touch /export/download_finished
-					fi
-				fi
-			fi
+			realmasterip=`echo ${masteripaddress} | awk '{print $1}'`
+			while ! mount | grep export | grep -v grep
+			do
+				LOG "\tmounting /export ..."
+				mount -o tcp,vers=3,rsize=32768,wsize=32768 ${realmasterip}:/export /export
+				sleep 60
+			done
+			LOG "\tmounted /export ..."
 		fi
 	else
-		echo "wont come here before failover implementation"
+		echo doing nothing
 	fi
 }
 
-function generate_entitlement()
+function funcDetermineConnection()
 {
-	if [ "$PRODUCT" == "SYMPHONY" -o "$PRODUCT" == "symphony" ]
+	if [ -z "$masterprivateipaddress" ]
 	then
-		if [ -n "$entitlement" ]
-		then
-			echo $entitlement | base64 -d > ${ENTITLEMENT_FILE}
-			sed -i 's/\(sym_[a-z]*_edition .*\)/\n\1/' ${ENTITLEMENT_FILE}
-			echo >> ${ENTITLEMENT_FILE}
-		fi
+		## on master node
+		masterprivateipaddress=$(funcGetPrivateIp)
+		masterpublicipaddress=$(funcGetPublicIp)
 	fi
-}
-
-function install_symphony()
-{
-	LOG "installing ${PRODUCT} version ${VERSION} ..."
-	sed -i -e '/7869/d'  -e '/7870/d' -e '/7871/d' /etc/services
-	echo "... trying to install symphony version $VERSION"
-	if [ "${ROLE}" == "symde" ]
+	masteripaddress=${masterprivateipaddress}
+	realmasteripaddress=`echo ${masterprivateipaddress} | awk '{print $1}'`
+	
+	## if localipaddress is not in the same subnet as masterprivateipaddress, force using internet
+	if [ "${localipaddress%.*}" != "${realmasteripaddress%.*}" ]
 	then
-		if [ "$VERSION" == "latest" -o "$VERSION" = "7.2.0.0" ]
-		then
-			LOG "\tsh /export/symphony/${VERSION}/symde-7.2.0.0_x86_64.bin --quiet"
-			sh /export/symphony/${VERSION}/symde-7.2.0.0_x86_64.bin --quiet
-		fi
-	else
-		if [ "${ROLE}" == "symcompute" ]
-		then
-			export EGOCOMPUTEHOST=Y
-		fi
-		if [ "$VERSION" == "latest" -o "$VERSION" = "7.2.0.0" ]
-		then
-			LOG "\tsh /export/symphony/${VERSION}/sym-7.2.0.0_x86_64.bin --quiet"
-			sh /export/symphony/${VERSION}/sym-7.2.0.0_x86_64.bin --quiet
-		elif [ "$VERSION" == "7.1.2" ]
-		then
-			LOG "\tsh /export/symphony/${VERSION}/sym-7.1.2.0_x86_64.bin --quiet"
-			sh /export/symphony/${VERSION}/sym-7.1.2.0_x86_64.bin --quiet
-		else
-			LOG "\tfailed to install application"
-			echo "... unimplimented version"
-			echo "... failed to install application" >> /root/symphony_failed
-		fi
+		useintranet=false
 	fi
-}
-
-function start_symphony()
-{
-	if [ "${ROLE}" == "symhead" -o "${ROLE}" == "symcompute" ]
+	if [ "$useintranet" == "false" ]
 	then
-		LOG "\tstart symphony..."
-		service ego start
-	fi
-}
-
-function configure_symphony()
-{
-	SOURCE_PROFILE=/opt/ibm/spectrumcomputing/profile.platform
-	## currently only single master
-	if [ "$MASTERHOSTNAMES" == "$MASTERHOST" ]
-	then
-		# no failover
-		if [ "${ROLE}" == "symhead" ]
-		then
-			LOG "configure symphony master ..."
-			LOG "\tsu $CLUSTERADMIN -c \". ${SOURCE_PROFILE}; egoconfig join ${MASTERHOST} -f; egoconfig setentitlement ${ENTITLEMENT_FILE}\""
-			su $CLUSTERADMIN -c ". ${SOURCE_PROFILE}; egoconfig join ${MASTERHOST} -f; egoconfig setentitlement ${ENTITLEMENT_FILE}"
-			sed -i 's/AUTOMATIC/MANUAL/' /opt/ibm/spectrumcomputing/eservice/esc/conf/services/named.xml
-			sed -i 's/AUTOMATIC/MANUAL/' /opt/ibm/spectrumcomputing/eservice/esc/conf/services/wsg.xml
-			## disable compute role on head if there is compute nodes
-			if [ ${numbercomputes} -gt 0 ]
-			then
-				sed -ibak "s/\(^${MASTERHOST} .*\)(linux)\(.*\)/\1(linux mg)\2/" /opt/ibm/spectrumcomputing/kernel/conf/ego.cluster.${clustername}
-			fi
-		elif [ "$ROLE" == "symcompute" ]
-		then
-			LOG "configure symphony compute node ..."
-			LOG "\tsu $CLUSTERADMIN -c \". ${SOURCE_PROFILE}; egoconfig join ${MASTERHOST} -f\""
-			su $CLUSTERADMIN -c ". ${SOURCE_PROFILE}; egoconfig join ${MASTERHOST} -f"
-		elif [ "$ROLE" == "symde" ]
-		then
-			LOG "configure symphony de node ..."
-			sed -i "s/^EGO_MASTER_LIST=.*/EGO_MASTER_LIST=${MASTERHOST}/" /opt/ibm/spectrumcomputing/symphonyde/de72/conf/ego.conf
-			sed -i "s/^EGO_KD_PORT=.*/EGO_KD_PORT=7870/" /opt/ibm/spectrumcomputing/symphonyde/de72/conf/ego.conf
-			LOG "\tconfigured symphony de node ..."
-		else
-			echo nothing to do
-		fi
-	fi
-	if [ "${ROLE}" == "symhead" -o "${ROLE}" == "symcompute" ]
-	then
-		LOG "prepare to start symphony cluster ..."
-		LOG "\tegosetrc.sh; egosetsudoers.sh"
-		. ${SOURCE_PROFILE}
-		egosetrc.sh
-		egosetsudoers.sh
-		sleep 2
+		masteripaddress=${masterpublicipaddress}
+		localipaddress=$(funcGetPublicIp)
 	fi
 }
 ##################END FUNCTIONS RELATED######################
@@ -335,64 +240,10 @@ function configure_symphony()
 # configure OS, install basic utilities like wget curl mount .etc
 os_config
 
-# write /tmp/user_metadata.py script to get user_metadata
-get_user_metadata
-
-# source user_metadata as shell environment
-eval `python /tmp/user_metadata.py`
-
-# handle environment
-[ -z "$product" ] && product=SYMPHONY
-[ -z "$version" ] && version=latest
-[ -z "$domain" ] && domain=domain.com
-[ -z "$clustername" ] && clustername=symcluster
-if [ -z "$role" ]
-then
-	if hostname | grep -qi master
-	then
-		role=symhead
-	else
-		role=symcompute
-	fi
-fi
-if [ "$useintranet" == "0" ]
-then
-	useintranet=false
-elif [ "$useintranet" == "1" ]
-then
-	useintranet=true
-else
-	echo "no action"
-fi
-
-# get local intranet IP address and local hostname
-if [ -z "$masterprivateipaddress" ]
-then
-	## on master node
-	masterprivateipaddress=$(funcGetPrivateIp)
-	masterpublicipaddress=$(funcGetPublicIp)
-fi
-masteripaddress=${masterprivateipaddress}
-localipaddress=$(funcGetPrivateIp)
-localnetmask=$(funcGetPrivateMask)
-# if localipaddress is not in the same subnet as masterprivateipaddress, force using internet
-if [ "${localipaddress%.*}" != "${masterprivateipaddress%.*}" ]
-then
-	useintranet=false
-fi
-if [ "$useintranet" == "false" ]
-then
-	masteripaddress=${masterpublicipaddress}
-	localipaddress=$(funcGetPublicIp)
-fi
+# get local hostname, ipaddress and netmask
 localhostname=$(hostname -s)
-
-# create and/or start up upd server/client to update /etc/hosts and other messages
-if [ "$role" == "symhead" ]
-then
-	create_udp_server
-fi
-create_udp_client
+localipaddress=$(funcGetPrivateIp)
+echo -e "127.0.0.1\tlocalhost.localdomain\tlocalhost\n${localipaddress}\t${localhostname}.${domain}\t${localhostname}" > /etc/hosts
 
 #normalize variables
 export PRODUCT=$product
@@ -402,31 +253,73 @@ export CLUSTERNAME=$clustername
 export OVERWRITE_EGO_CONFIGURATION=Yes
 export SIMPLIFIEDWEM=N
 export ENTITLEMENT_FILE=/tmp/entitlement
-if [ -z "$masterhostnames" ]
+export MASTERHOSTNAMES=$masterhostnames
+export MASTERHOST=`echo $MASTERHOSTNAMES | awk '{print $1}'`
+export FAILOVERHOST=`echo $MASTERHOSTNAMES | awk '{print $NF}'`
+if [ "$ROLE" == "master" ]
 then
-	funcStartConfService
-	masterhostnames=${localhostname}
-	echo -e "127.0.0.1\tlocalhost.localdomain\tlocalhost\n${localipaddress}\t${localhostname}.${domain}\t${localhostname}" > /etc/hosts
-	export MASTERHOSTNAMES=$masterhostnames
-	export MASTERHOST=`echo $MASTERHOSTNAMES | awk '{print $1}'`
-else
-	export MASTERHOSTNAMES=$masterhostnames
-	export MASTERHOST=`echo $MASTERHOSTNAMES | awk '{print $1}'`
-	if [ "${ROLE}" != "symde" ]
-	then
-		funcConnectConfService
-	fi
-	python /tmp/udpclient.py "update ${localipaddress} ${localhostname}.${domain} ${localhostname}"
-	echo -e "127.0.0.1\tlocalhost.localdomain\tlocalhost\n${masteripaddress}\t${MASTERHOST}.${domain}\t${MASTERHOST}\n${localipaddress}\t${localhostname}.${domain}\t${localhostname}" > /etc/hosts
-	ping -c2 -w2 ${MASTERHOST}
+	export MASTERHOSTNAMES=${localhostname}
+	export MASTERHOST=${localhostname}
+	export FAILOVERHOST=${localhostname}
 fi
+
+# determine to use intranet or internet interface
+funcDetermineConnection
+
+# start nfs service on primary master and nfs server and try to mount nfs service from compute nodes
+funcConnectFailoverService
+if [ "$role" == "nfsserver" ]
+then
+	funcStartFailoverService
+	exit
+fi
+funcStartConfService
+funcConnectConfService
+
+# download functions file if not there already
+LOG "donwloading product function file and source it"
+if [ -n "${functionsfile}" ]
+then
+	if [ ! -f /export/${product}.sh ]
+	then
+		wget --no-check-certificate -o /dev/null -O /export/${product}.sh ${functionsfile}
+	fi
+	LOG "\tfound /export/${product}.sh"
+fi
+. /export/${product}.sh
+
+# create and/or start up upd server/client to update /etc/hosts and other messages
+if [ "$role" == "master" -o "$role" == "failover" ]
+then
+	create_udp_server
+fi
+if [ "$role" != "master" -a "$role" != "nfsserver" ]
+then
+	create_udp_client
+fi
+
+if [ "$ROLE" != "nfsserver" -a "$ROLE" != "master" ]
+then
+	echo -e "`echo ${masteripaddress} | awk '{print $1}'`\t${MASTERHOST}.${domain}\t${MASTERHOST}" >> /etc/hosts
+	python /tmp/udpclient.py "update ${localipaddress} ${localhostname}.${domain} ${localhostname}"
+	ping -c2 -w2 ${MASTERHOST}
+	if [ "$MASTERHOST" != "${FAILOVERHOST}" ]
+	then
+		echo -e "`echo ${masteripaddress} | awk '{print $NF}'`\t${FAILOVERHOST}.${domain}\t${FAILOVERHOST}" >> /etc/hosts
+		ping -c2 -w2 ${FAILOVERHOST}
+	fi
+else
+	echo nothing
+fi
+
+
 export DERBY_DB_HOST=$MASTERHOST
 if [ -z "$clusteradmin" ]
 then
-	if [ "$product" == "SYMPHONY" -o "$product" == "symphony" ]
+	if [ "$product" == "symphony" -o "$product" == "cws" ]
 	then
 		clusteradmin=egoadmin
-	elif [ "$product" == "LSF" -o "$product" == "lsf"  ]
+	elif [ "$product" == "lsf"  ]
 	then
 		clusteradmin=lsfadmin
 	else
@@ -444,10 +337,11 @@ app_depend
 # download packages to /export
 download_packages
 
-if [ "${ROLE}" == "symhead" -o "${ROLE}" == "lsfmaster" ]
+# generate entitlement file or wait for download
+generate_entitlement
+
+if [ "${ROLE}" != "master" ]
 then
-	generate_entitlement
-else
 	## wait untils /export/download_finished appears
 	while [ ! -f /export/download_finished ]
 	do
@@ -456,103 +350,21 @@ else
 	done
 	LOG "\tpackages downloaded ..."
 fi
-# generate entitlement file
 
-# install symphony
-SOURCE_PROFILE=/opt/ibm/spectrumcomputing/profile.platform
-if [ "$PRODUCT" == "SYMPHONY" -o "$PRODUCT" == "symphony" ]
+#deploy product 
+if [ "$PRODUCT" == "symphony" ]
 then
-	install_symphony >> $LOG_FILE 2>&1
-	configure_symphony >> $LOG_FILE 2>&1
-	update_profile_d
-	start_symphony >> $LOG_FILE 2>&1
-	sleep 120 
-	## watch 2 more rounds to make sure symhony service is running
-	while [ $ROUND -lt 2 ]
-	do
-		if [ "$ROLE" == "symde" ]
-		then
-			break
-		fi
-		if ! ps ax | egrep "opt.ibm.*lim" | grep -v grep > /dev/null
-		then
-			start_symphony
-			sleep 120
-			continue
-		else
-			sleep 20
-			. ${SOURCE_PROFILE}
-			ROUND=$((ROUND+1))
-			## prepare demo examples
-			LOG "prepare demo examples ..."
-			LOG "\tlogging in ..."
-			egosh user logon -u Admin -x Admin
-			LOG "\tlogged in ..."
-			LOG "create /SampleAppCPP consumer ..."
-			egosh consumer add "/SampleAppCPP" -a Admin -u Guest -e egoadmin -g "ManagementHosts,ComputeHosts" >> $LOG_FILE 2>&1
-			break
-		fi
-	done
-	echo "$PRODUCT $VERSION $ROLE ready `date`" >> /root/application-ready
-	LOG "symphony cluster is now ready ..."
-	cat << ENDF > /tmp/post.sh
-if [ "${ROLE}" == "symde" ]
+	SOURCE_PROFILE=/opt/ibm/spectrumcomputing/profile.platform
+	deploy_product
+elif [ "$PRODUCT" == "cws" -o "$PRODUCT" == "lsf" ]
 then
-	echo -e "\tpost configuration for DE host" >> ${LOG_FILE}
-	echo -e "\t...logon to soam client" >> ${LOG_FILE}
-	while [ 1 -lt 2 ]
-	do
-		if su - egoadmin -c "soamlogon -u Admin -x Admin" >/dev/null 2>&1
-		then
-			break
-		else
-			sleep 60
-		fi
-	done
-	echo -e "\t...logged on to soam client" >> ${LOG_FILE}
-	echo -e "\twait 2 minutes for the muster to create consumer" >> ${LOG_FILE}
-	wait 120
-	su - egoadmin -c "cd /opt/ibm/spectrumcomputing/symphonyde/de72/7.2/samples/CPP/SampleApp; make ; cd Output; gzip SampleServiceCPP; soamdeploy add SampleServiceCPP -p SampleServiceCPP.gz -c \"/SampleAppCPP\""
-	su - egoadmin -c "cd /opt/ibm/spectrumcomputing/symphonyde/de72/7.2/samples/CPP/SampleApp; sed -ibak 's/<SSM resReq/<SSM resourceGroupName=\"ManagementHosts\" resReq/' SampleApp.xml; sed -ibak 's/preStartApplication=/resourceGroupName=\"ComputeHosts\" preStartApplication=/' SampleApp.xml; soamreg SampleApp.xml"
-	su - egoadmin -c "cd /opt/ibm/spectrumcomputing/symphonyde/de72/7.2/samples/CPP/SampleApp/Output; ./SyncClient >> $LOG_FILE 2>&1; ./AsyncClient >> $LOG_FILE 2>&1"
-
-elif [ "${ROLE}" == 'symhead' ]
-then
-	if [ ! -f /etc/checkfailover ]
-	then
-		. ${SOURCE_PROFILE}
-		egosh user logon -u Admin -x Admin
-		while [ 1 -lt 2 ]
-		do
-			if su - egoadmin -c "egosh user logon -u Admin -x Admin" >/dev/null 2>&1
-			then
-				break
-			else
-				sleep 60
-			fi
-		done
-		echo -e "\t...logged on to ego" >> ${LOG_FILE}
-	fi
-else
-	echo "nothing to do"
-fi
-ENDF
-
-# install LSF
-elif [ "$PRODUCT" == "LSF" -o "$PRODUCT" == "lsf" ]
-then
-	echo installing spectrum computing LSF
+	echo installing spectrum computing $PRODUCT 
+	deploy_product
 else
 	echo "unsupported product $PRODUCT `date`" >> /root/application-failed
 fi
 
-[ -x /tmp/post.sh ] || chmod +x /tmp/post.sh
 [ -x /tmp/post.sh ] && /tmp/post.sh >> /tmp/output
 
 echo "$0 execution ends at `date`" >> /tmp/output
-## keep the script running in case symphony stop when shell terminates
-while [ 1 -lt 2 ]
-do
-	sleep 3600
-done
 ###################END OF MAIN PROCEDURE##################
