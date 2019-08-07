@@ -9,10 +9,15 @@ terraform {
 ##############################################################################
 # See the README for details on ways to supply these values
 # Configure the IBM Cloud Provider
+
+variable "region" {default="us-south"}
+
 provider "ibm" {
-  bluemix_api_key    = "${var.bluemix_api_key}"
+  ibmcloud_api_key    = "${var.bluemix_api_key}"
   softlayer_username = "${var.softlayer_username}"
   softlayer_api_key  = "${var.softlayer_api_key}"
+  generation         = 1
+  region             = "${var.region}"
 }
 
 variable bluemix_api_key {
